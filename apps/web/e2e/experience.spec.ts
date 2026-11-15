@@ -456,3 +456,65 @@ test("行を長く押す（右クリックする）と記事の操作が出て�
   await page.keyboard.press("Shift+J");
   await expect(page).toHaveURL(new RegExp(`/feeds/${beta.id}$`));
 });
+
+test("記事の画面から、リンクを共有し、文字の大きさを変えられる", async ({ page, context }) => {
+  const { server } = seed();
+  const [first] = [...server.inbox.values()];
+  if (first === undefined) throw new Error("unreachable");
+  first.url = "https://blog.example/first";
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await routeFakeSendo(context, server);
+  await page.goto("/");
+  await signIn(page);
+  const view = page.locator(".article-view");
+  await page.locator(".article-list .title", { hasText: "1 番目" }).click();
+  await expect(view.getByRole("heading", { level: 1 })).toHaveText("1 番目");
+
+  // 共有の窓がなければ、リンクをコピーする
+  await view.getByRole("button", { name: "共有する" }).click();
+  await expect(view.getByRole("status")).toHaveText("リンクをコピーしました。");
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
+    "https://blog.example/first",
+  );
+
+  // 共有の窓があれば、タイトルと URL を渡す
+  await page.evaluate(() => {
+    const shared: ShareData[] = [];
+    Object.assign(window, { shared });
+    Object.defineProperty(navigator, "share", {
+      configurable: true,
+      value: (data: ShareData) => {
+        shared.push(data);
+        return Promise.resolve();
+      },
+    });
+  });
+  await view.getByRole("button", { name: "共有する" }).click();
+  await expect
+    .poll(() => page.evaluate(() => (window as unknown as { shared: ShareData[] }).shared))
+    .toEqual([{ title: "1 番目", url: "https://blog.example/first" }]);
+
+  // 記事を開いたまま、文字の大きさを変える
+  await view.getByRole("button", { name: "文字の大きさとテーマ" }).click();
+  await page.getByRole("dialog").getByText("大", { exact: true }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-text-size", "large");
+  await expect(page.getByRole("dialog")).not.toContainText("記事の一覧");
+  await page.keyboard.press("Escape");
+
+  // 文字を大きくしても、記事の欄からボタンがはみ出さない（3 カラムの狭い欄でも、狭い画面の
+  // 下のバーでも）
+  for (const [width, first] of [
+    [1024, "記事を閉じる"],
+    [360, "一覧に戻る"],
+  ] as const) {
+    await page.setViewportSize({ width, height: 640 });
+    const pane = await view.boundingBox();
+    for (const name of [first, "文字の大きさとテーマ"]) {
+      const box = await view.getByRole("button", { name }).boundingBox();
+      expect(box?.x).toBeGreaterThanOrEqual(pane?.x ?? 0);
+      expect((box?.x ?? 0) + (box?.width ?? 0)).toBeLessThanOrEqual(
+        (pane?.x ?? 0) + (pane?.width ?? 0),
+      );
+    }
+  }
+});
