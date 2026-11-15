@@ -1,6 +1,5 @@
 <script lang="ts">
   import type { Article } from "@sendo-reader/core";
-  import type { Snippet } from "svelte";
   import { useReader } from "../lib/context";
   import { compactCount, dayLabel, shortTime } from "../lib/format";
   import type { ArticleListState, ListProgress } from "../lib/list.svelte";
@@ -22,7 +21,6 @@
     onoption,
     onmenu,
     next,
-    leading,
   }: {
     list: ArticleListState;
     title: string;
@@ -44,8 +42,6 @@
     onmenu: (article: Article) => void;
     /** 一覧の終わりに出す、次へ進むボタン（出さないなら null） */
     next: { label: string; go: () => void } | null;
-    /** 見出しの左に置くもの（狭い画面のメニューのボタン） */
-    leading?: Snippet;
   } = $props();
 
   const reader = useReader();
@@ -190,13 +186,18 @@
     return { destroy: () => observer.disconnect() };
   }
 
+  /** その向き（dx が正なら右へ）のスワイプに割り当てた操作（設定で変えられる） */
+  function swipeAction(dx: number) {
+    return dx > 0 ? prefs.value.swipes.listRight : prefs.value.swipes.listLeft;
+  }
+
   /** これだけ横に動かして離したら、操作する（px） */
   const SWIPE = 72;
   /** これだけ押し続けたら、その記事の操作を出す（ミリ秒） */
   const LONG_PRESS = 500;
 
   /**
-   * 指で行を横にはじく。右へはじくと既読・未読、左へはじくとスターを切り替える。
+   * 指で行を横にスワイプする。割り当ては設定で変えられる（既定は、右でスター、左で既読・未読）。
    * 縦に動かし始めたら、一覧を動かすだけにする（行は touch-action: pan-y）。
    * 動かさずに長く押す（マウスなら右クリック）と、その記事の操作を出す
    */
@@ -268,10 +269,13 @@
         node.dataset.swiping = "";
       }
       dx = Math.max(-SWIPE * 1.6, Math.min(SWIPE * 1.6, x));
-      const field = dx > 0 ? "readAt" : "starredAt";
-      node.dataset.swipe = dx > 0 ? "read" : "star";
+      const action = swipeAction(dx);
+      // その向きに何も割り当てていなければ、行は動かさない
+      if (action === "none") return reset();
+      node.dataset.swipe = action;
+      node.dataset.swipeSide = dx > 0 ? "start" : "end";
       node.dataset.swipeLabel =
-        field === "readAt"
+        action === "read"
           ? current.readAt === null
             ? "既読にする"
             : "未読に戻す"
@@ -284,7 +288,10 @@
     }
 
     function onEnd() {
-      if (sideways && Math.abs(dx) >= SWIPE) toggle(current, dx > 0 ? "readAt" : "starredAt");
+      const action = swipeAction(dx);
+      if (sideways && Math.abs(dx) >= SWIPE && action !== "none") {
+        toggle(current, action === "read" ? "readAt" : "starredAt");
+      }
       reset();
     }
 
@@ -323,7 +330,6 @@
 
 <section class="article-list" aria-label={title} bind:this={scroller}>
   <header>
-    {@render leading?.()}
     {#if progress !== null}
       <button
         type="button"
@@ -934,11 +940,11 @@
     font-weight: 600;
   }
 
-  .row:global([data-swiping][data-swipe="read"])::after {
+  .row:global([data-swiping][data-swipe-side="start"])::after {
     left: 1rem;
   }
 
-  .row:global([data-swiping][data-swipe="star"])::after {
+  .row:global([data-swiping][data-swipe-side="end"])::after {
     right: 1rem;
   }
 
