@@ -26,6 +26,8 @@ export class ReaderState {
   folders = $state<Folder[]>([]);
   feeds = $state<Feed[]>([]);
   unread = $state<UnreadCounts>({ total: 0, feeds: new Map(), folders: new Map() });
+  /** 今日（この端末の日付で）既読にした記事の数。進み具合の内訳に出す */
+  readToday = $state(0);
   /** 記事が変わるたびに増える。一覧や記事の画面は、これを見て読み直す */
   articlesVersion = $state(0);
 
@@ -98,6 +100,11 @@ export class ReaderState {
   }
 
   async #loadUnread(): Promise<void> {
-    this.unread = await this.client.countUnread();
+    const [unread, readToday] = await Promise.all([
+      this.client.countUnread(),
+      this.client.countReadSince(new Date().setHours(0, 0, 0, 0)),
+    ]);
+    this.unread = unread;
+    this.readToday = readToday;
   }
 }
