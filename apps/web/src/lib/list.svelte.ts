@@ -31,6 +31,8 @@ export class ArticleListState {
    * 残っている未読の数と合わせて、一覧の進み具合を出す
    */
   done = $state(0);
+  /** 条件を替えて開き直すたびに増える。一覧の部品は、これを見て先頭に戻す */
+  opened = $state(0);
   /** キーボードで選んでいる記事（開いてはいない） */
   cursorId = $state<string | null>(null);
 
@@ -67,6 +69,7 @@ export class ArticleListState {
   /** 条件を替えて、最初から読む */
   show(query: ArticleQuery): Promise<void> {
     this.#query = query;
+    this.opened += 1;
     this.cursorId = null;
     this.#seenUnread.clear();
     this.#readHere.clear();
@@ -173,6 +176,27 @@ export class ArticleListState {
     try {
       if (field === "readAt") await this.#client.setRead(article.id, on);
       else await this.#client.setStarred(article.id, on);
+    } catch (error) {
+      await this.refresh();
+      throw error;
+    }
+  }
+
+  /**
+   * いくつかの記事をまとめて既読にする（一覧を動かして通り過ぎた記事）。すでに既読のものは
+   * 飛ばす。押したときと同じく、画面にはすぐ出し、書けなかったら手元の DB の状態に戻す
+   */
+  async markRead(ids: readonly string[]): Promise<void> {
+    const wanted = new Set(ids);
+    const unread = this.articles.filter((a) => wanted.has(a.id) && a.readAt === null);
+    if (unread.length === 0) return;
+    const targets = new Set(unread.map((article) => article.id));
+    const readAt = Date.now();
+    this.#articles = this.articles.map((article) =>
+      targets.has(article.id) ? { ...article, readAt } : article,
+    );
+    try {
+      await this.#client.setReadMany([...targets], true);
     } catch (error) {
       await this.refresh();
       throw error;

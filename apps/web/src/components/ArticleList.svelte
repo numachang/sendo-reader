@@ -2,7 +2,7 @@
   import type { Article } from "@sendo-reader/core";
   import type { Snippet } from "svelte";
   import { useReader } from "../lib/context";
-  import { dayLabel, shortTime } from "../lib/format";
+  import { compactCount, dayLabel, shortTime } from "../lib/format";
   import type { ArticleListState, ListProgress } from "../lib/list.svelte";
   import { prefs } from "../lib/prefs.svelte";
   import { handleLink, isPlainClick, router } from "../lib/router.svelte";
@@ -67,12 +67,70 @@
   $effect(() => {
     const id = currentId;
     if (id === null || scroller === undefined) return;
-    for (const row of scroller.querySelectorAll<HTMLElement>("[data-article]")) {
+    for (const row of scroller.querySelectorAll<HTMLElement>(".row[data-article]")) {
       if (row.dataset.article === id) {
         row.scrollIntoView({ block: "nearest" });
         break;
       }
     }
+  });
+
+  /**
+   * 一覧を動かして、見出しの下を上へ通り過ぎた未読の記事を、既読にする（設定で切れる）。
+   * 行ごとに位置を測らず、IntersectionObserver で「見えなくなって、上にある」行だけを拾う。
+   * 少しためてから、まとめて書く
+   */
+  let observer: IntersectionObserver | undefined;
+  /** 一度でも画面に出た行。出ていない行（別の一覧に替えた直後に上にある行など）は数えない */
+  const seen = new WeakSet<Element>();
+  const passed = new Set<string>();
+  let flushTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function flushPassed() {
+    const ids = [...passed];
+    passed.clear();
+    // 書けなかったら、一覧が手元の DB の状態に戻る
+    list.markRead(ids).catch(() => {});
+  }
+
+  function onPass(entries: IntersectionObserverEntry[]) {
+    for (const entry of entries) {
+      const bounds = entry.rootBounds;
+      const rect = entry.boundingClientRect;
+      if (entry.isIntersecting) {
+        seen.add(entry.target);
+        continue;
+      }
+      // 一覧を出していないとき（狭い画面で記事を開いている）は、位置が分からないので何もしない
+      if (bounds === null || bounds.height === 0 || rect.height === 0) continue;
+      // 監視を始めたときの知らせなど、画面に出たことのない行は、通り過ぎたのではない
+      if (!seen.has(entry.target)) continue;
+      // 下にあって見えていない行は、まだ通り過ぎていない
+      if (rect.bottom > bounds.top) continue;
+      const id = (entry.target as HTMLElement).dataset.article;
+      if (id !== undefined && prefs.value.markReadOnScroll) passed.add(id);
+    }
+    if (passed.size === 0) return;
+    clearTimeout(flushTimer);
+    flushTimer = setTimeout(flushPassed, 250);
+  }
+
+  function watchPass(node: HTMLElement) {
+    const root = node.closest<HTMLElement>(".article-list");
+    const header = root?.querySelector("header");
+    observer ??= new IntersectionObserver(onPass, {
+      root,
+      rootMargin: `-${header?.offsetHeight ?? 0}px 0px 0px 0px`,
+    });
+    observer.observe(node);
+    return { destroy: () => observer?.unobserve(node) };
+  }
+
+  // 別の一覧に替えたら、先頭に戻す（前の一覧の位置のまま、新しい一覧の途中を出さない）
+  $effect(() => {
+    void list.opened;
+    passed.clear();
+    scroller?.scrollTo({ top: 0 });
   });
 
   /** 一覧の終わりが近づいたら、続きを読む */
@@ -81,7 +139,7 @@
       (entries) => {
         if (entries.some((entry) => entry.isIntersecting)) void list.loadMore();
       },
-      { root: scroller ?? null, rootMargin: "600px" },
+      { root: node.closest(".article-list"), rootMargin: "600px" },
     );
     observer.observe(node);
     return { destroy: () => observer.disconnect() };
@@ -204,6 +262,7 @@
             />
           {/if}
         </svg>
+        <span class="gauge-count" aria-hidden="true">{compactCount(progress.remaining)}</span>
       </button>
     {/if}
     <h2>
@@ -290,7 +349,7 @@
   {:else}
     <ol class:compact={prefs.value.layout === "compact"}>
       {#each rows as { article, heading } (article.id)}
-        <li>
+        <li data-article={article.id} use:watchPass>
           {#if heading !== null}
             <h3>{heading}</h3>
           {/if}
@@ -384,20 +443,33 @@
   .gauge {
     display: none;
     flex: none;
-    width: 2.25rem;
-    height: 2.25rem;
-    margin-right: 0.25rem;
-    padding: 0.3rem;
+    position: relative;
+    width: 2.5rem;
+    height: 2.5rem;
+    margin-right: 0.375rem;
+    padding: 0.125rem;
     border: 0;
     border-radius: 50%;
     background: none;
+  }
+
+  /* 輪の中に、残っている未読の数を出す */
+  .gauge-count {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    color: var(--muted);
+    font-size: 0.625rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
   }
 
   .gauge svg {
     display: block;
     transform: rotate(-90deg);
     fill: none;
-    stroke-width: 5;
+    stroke-width: 3.5;
   }
 
   .track {
@@ -412,6 +484,11 @@
   @media (max-width: 56rem) {
     .gauge {
       display: block;
+    }
+
+    /* 数は輪の中に出している */
+    h2 .count {
+      display: none;
     }
   }
 
