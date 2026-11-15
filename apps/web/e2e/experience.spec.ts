@@ -525,3 +525,82 @@ test("記事の画面から、リンクを共有し、文字の大きさを変�
     }
   }
 });
+
+test("手元の記事を探せる（オフラインでも）。探した結果は、通り過ぎても既読にしない", async ({
+  page,
+  context,
+}) => {
+  const server = new FakeSendo();
+  const feed = server.subscribe({ url: "https://blog.example/feed.xml", title: "Blog" });
+  const t = Date.now();
+  server.deliver(feed.id, { title: "SQLite を OPFS で使う", publishedAt: t - 1000 });
+  server.deliver(feed.id, {
+    title: "同期の設計",
+    summary: "カーソルと sqlite の話",
+    publishedAt: t - 2000,
+  });
+  server.deliver(feed.id, { title: "週末のまとめ", author: "山田 太郎", publishedAt: t - 3000 });
+  await routeFakeSendo(context, server);
+  await page.goto("/");
+  await signIn(page);
+  const list = page.locator(".article-list");
+  await expect(list.locator(".item")).toHaveCount(3);
+  await context.setOffline(true);
+
+  // / で検索の画面を開く。すぐ打てる
+  await page.keyboard.press("/");
+  await expect(page).toHaveURL(/\/search$/);
+  const input = list.getByRole("searchbox", { name: "記事を探す" });
+  await expect(input).toBeFocused();
+  await expect(list.getByText("手元の記事を探します。")).toBeVisible();
+
+  // 探す言葉が空の間は、記事を出していない。入力から抜けて j を押しても、見えていない記事を
+  // 開かない（既読にもしない）
+  await input.press("Enter");
+  await page.keyboard.press("j");
+  await page.waitForTimeout(300);
+  await expect(page).not.toHaveURL(/article=/);
+  await expect(page).toHaveTitle("(3) 検索 - Sendo");
+  await input.focus();
+
+  // タイトル・要約・著者から探す。空白で区切ると、すべての言葉が入っているものだけ
+  await input.fill("sqlite");
+  await expect(list.locator(".title")).toHaveText(["SQLite を OPFS で使う", "同期の設計"]);
+  await expect(page).toHaveURL(/\/search\?q=sqlite$/);
+  await input.fill("sqlite カーソル");
+  await expect(list.locator(".title")).toHaveText(["同期の設計"]);
+  await input.fill("山田");
+  await expect(list.locator(".title")).toHaveText(["週末のまとめ"]);
+  await input.fill("どこにもない言葉");
+  await expect(list.getByText("見つかりませんでした。")).toBeVisible();
+
+  // Enter で入力から抜けると、j で結果を開ける。開き直しても、探した言葉が残る
+  await input.fill("sqlite");
+  await expect(list.locator(".title")).toHaveCount(2);
+  await input.press("Enter");
+  await page.keyboard.press("j");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("SQLite を OPFS で使う");
+  await page.reload();
+  await expect(list.getByRole("searchbox", { name: "記事を探す" })).toHaveValue("sqlite");
+  await expect(list.locator(".title")).toHaveText(["SQLite を OPFS で使う", "同期の設計"]);
+
+  // 打ってすぐ別の画面へ移っても、検索の画面に引き戻さない
+  await list
+    .getByRole("searchbox", { name: "記事を探す" })
+    .pressSequentially("opfs", { delay: 10 });
+  await page.locator("nav").getByRole("link", { name: "購読の管理" }).click();
+  await page.waitForTimeout(500);
+  await expect(page).toHaveURL(/\/manage$/);
+  await page.locator("nav").getByRole("link", { name: "検索" }).click();
+  await list
+    .getByRole("searchbox", { name: "記事を探す" })
+    .pressSequentially("opfs", { delay: 10 });
+  await page.locator("nav").getByRole("link", { name: "スター" }).click();
+  await page.waitForTimeout(500);
+  await expect(page).toHaveURL(/\/starred$/);
+
+  // 左のメニューからも開ける
+  await page.locator("nav").getByRole("link", { name: "未読" }).click();
+  await page.locator("nav").getByRole("link", { name: "検索" }).click();
+  await expect(list.getByRole("searchbox", { name: "記事を探す" })).toHaveValue("");
+});

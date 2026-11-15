@@ -35,7 +35,7 @@
     menuOpen = false;
   });
 
-  type ListKind = "unread" | "all" | "starred" | "feed" | "folder";
+  type ListKind = "unread" | "all" | "starred" | "feed" | "folder" | "search";
   interface Listing {
     kind: ListKind;
     query: ArticleQuery;
@@ -66,6 +66,14 @@
           title: "すべて",
           scope: { all: true },
           unread: reader.unread.total,
+        };
+      case "search":
+        return {
+          kind: "search",
+          query: { search: router.searchQuery, ...order },
+          title: "検索",
+          scope: null,
+          unread: null,
         };
       case "starred":
         return {
@@ -129,11 +137,16 @@
 
   // 条件が変わったときだけ読み直す（記事を開いたり閉じたりしただけでは読み直さない。
   // query は URL が変わるたびに作り直されるので、中身を文字列にして比べる）
-  const queryKey = $derived(listing === null ? null : JSON.stringify(listing.query));
+  // 探す言葉が空の検索では、何も読まない（"null" を鍵にして、何も出さない一覧にする）
+  const queryKey = $derived.by(() => {
+    if (listing === null) return null;
+    const blank = listing.kind === "search" && router.searchQuery.trim() === "";
+    return JSON.stringify(blank ? null : listing.query);
+  });
   $effect(() => {
     const key = queryKey;
     untrack(() => {
-      if (key !== null) void list.show(JSON.parse(key) as ArticleQuery);
+      if (key !== null) void list.show(JSON.parse(key) as ArticleQuery | null);
     });
   });
 
@@ -345,6 +358,7 @@
         chord = true;
         chordTimer = setTimeout(() => (chord = false), 1500);
       },
+      "/": () => go({ kind: "search" }),
       r: () => void reader.client.syncNow(),
       Escape: () => {
         if (menuOpen) menuOpen = false;
@@ -421,6 +435,8 @@
       kind={listing.kind}
       unread={listing.scope === null ? null : listing.unread}
       onmarkall={askMarkAll}
+      search={listing.kind === "search" ? router.searchQuery : null}
+      onsearch={(query) => router.setSearchQuery(query)}
       {options}
       onoption={(patch) => prefs.setViewOptions(viewKey, patch)}
       onmenu={openArticleMenu}
