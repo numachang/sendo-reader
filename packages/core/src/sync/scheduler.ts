@@ -1,9 +1,12 @@
 import { ApiError, type ApiErrorKind } from "../api/errors";
+import type { User } from "../models";
 import type { ReaderCore } from "../reader";
 
 /** 同期の様子。画面の「オフライン」「未送信 N 件」などの表示に使う */
 export interface SyncStatus {
   signedIn: boolean;
+  /** 手元に置いた、ログインしたユーザー */
+  user: User | null;
   syncing: boolean;
   /** 最後に同期できた時刻 */
   lastSyncedAt: number | null;
@@ -11,6 +14,8 @@ export interface SyncStatus {
   error: ApiErrorKind | null;
   /** まだ sendo に送り終えていない操作の数 */
   pending: number;
+  /** ログアウトを sendo に送れていない（送り直している） */
+  logoutPending: boolean;
 }
 
 export interface SchedulerOptions {
@@ -34,7 +39,9 @@ export const RETRY_DELAYS_MS = [5_000, 15_000, 60_000, PERIODIC_SYNC_MS] as cons
  * - 書き込んだら、少し待ってから送る（続けて操作したときに、まとめて送れるように）
  * - 何もなくても、一定の間隔で同期する
  * - 届かなかったら、間隔を延ばしながらやり直す。オンラインに戻ったら、すぐ試す
- * - トークンが使えなくなったら止め、ログインし直すまで待つ
+ * - セッションが切れたら止め、ログインし直すまで待つ
+ * - ログインしていなければ、送れていないログアウトだけを送る。届かなければ、間隔を延ばしながら
+ *   送り直す
  */
 export class SyncScheduler {
   readonly #core: ReaderCore;
@@ -61,10 +68,12 @@ export class SyncScheduler {
     this.#onStatus = options.onStatus ?? (() => {});
     this.#status = {
       signedIn: core.isSignedIn(),
+      user: core.currentUser(),
       syncing: false,
       lastSyncedAt: null,
       error: null,
       pending: 0,
+      logoutPending: false,
     };
   }
 
@@ -139,12 +148,21 @@ export class SyncScheduler {
 
   async #runOnce(): Promise<void> {
     if (!this.#core.isSignedIn()) {
-      this.#update({ signedIn: false, syncing: false, error: null });
+      this.#update({ signedIn: false, user: null, syncing: false, error: null });
+      // ログアウトを sendo に送れていなければ送る。届かなければ、間隔を延ばしながら送り直す
+      // （docs/decisions/local-first.md の 6。オンラインに戻ったときは、すぐ試す）
+      const sent = await this.#core.sendPendingSignOut();
+      this.#update({ logoutPending: !sent });
+      if (sent) {
+        this.#failures = 0;
+      } else {
+        this.#retryLater();
+      }
       // ログアウトで消えた操作の数も、画面から消す
       await this.#refreshPending();
       return;
     }
-    this.#update({ signedIn: true, syncing: true });
+    this.#update({ signedIn: true, syncing: true, logoutPending: false });
     try {
       await this.#core.sync();
       this.#failures = 0;
@@ -154,22 +172,31 @@ export class SyncScheduler {
       const kind = error instanceof ApiError ? error.kind : null;
       this.#update({ syncing: false, error: kind ?? "server" });
       if (kind === "unauthorized") {
-        // トークンが使えない。ログインし直すまで止める（requestNow で再開する）
+        // セッションが切れた。ログインし直すまで止める（requestNow で再開する）
         this.#cancelTimer();
       } else {
         if (kind === null) console.error("同期で予期しない失敗", error);
-        const delay = RETRY_DELAYS_MS[Math.min(this.#failures, RETRY_DELAYS_MS.length - 1)];
-        this.#failures += 1;
-        this.#schedule(delay ?? PERIODIC_SYNC_MS);
+        this.#retryLater();
       }
     } finally {
       await this.#refreshPending();
     }
   }
 
+  /** 失敗が続くほど間隔を延ばして、やり直しを予定する */
+  #retryLater(): void {
+    const delay = RETRY_DELAYS_MS[Math.min(this.#failures, RETRY_DELAYS_MS.length - 1)];
+    this.#failures += 1;
+    this.#schedule(delay ?? PERIODIC_SYNC_MS);
+  }
+
   async #refreshPending(): Promise<void> {
     try {
-      this.#update({ pending: await this.#core.countPending(), signedIn: this.#core.isSignedIn() });
+      this.#update({
+        pending: await this.#core.countPending(),
+        signedIn: this.#core.isSignedIn(),
+        user: this.#core.currentUser(),
+      });
     } catch {
       // 数えられなくても同期は続ける
     }
@@ -177,10 +204,14 @@ export class SyncScheduler {
 
   #update(patch: Partial<SyncStatus>): void {
     const next = { ...this.#status, ...patch };
-    const changed = (Object.keys(next) as (keyof SyncStatus)[]).some(
-      (key) => next[key] !== this.#status[key],
+    const changed = (Object.keys(next) as (keyof SyncStatus)[]).some((key) =>
+      key === "user" ? !sameUser(next.user, this.#status.user) : next[key] !== this.#status[key],
     );
     this.#status = next;
     if (changed) this.#onStatus({ ...next });
   }
+}
+
+function sameUser(a: User | null, b: User | null): boolean {
+  return a === null || b === null ? a === b : a.id === b.id && a.email === b.email;
 }
