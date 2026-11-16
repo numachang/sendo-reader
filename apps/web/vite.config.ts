@@ -1,6 +1,11 @@
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import { defineConfig, type Plugin } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
+import {
+  IMAGE_CACHE_MAX_AGE_SECONDS,
+  IMAGE_CACHE_NAME,
+  IMAGE_CACHE_URL_PATTERN,
+} from "../../packages/core/src/web/image-cache.ts";
 import { renderHeadersFile, securityHeaders } from "./security-headers.ts";
 
 /** 手元のサーバーにはヘッダーを付け、本番のビルドには _headers を書き出す */
@@ -26,6 +31,49 @@ function securityHeadersPlugin(): Plugin {
     },
   };
 }
+
+/** Workbox が、1 回の取得の間、プラグインの呼び出しに渡して回す入れ物 */
+type GenerationState = { state?: { generation?: string } };
+
+/**
+ * 画像のキャッシュを消したあと（ログアウト、ユーザーの切り替え）に、消す前に取りにいき始めた
+ * 画像が遅れて届いても、キャッシュに入れない（docs/decisions/images.md の 4）。
+ *
+ * 取りにいき始めたときの世代を覚え、入れる前と入れたあとに、世代が変わっていないかを見る。
+ * 世代の印は packages/core/src/web/image-cache.ts の clearImageCache が進める。
+ *
+ * この関数は、ビルドのときに文字にして Service Worker に埋め込まれる。外の変数や関数を
+ * 参照できないので、印の置き場所（IMAGE_CACHE_GENERATION と同じ名前）を直接書いている。
+ */
+const imageCacheGenerationPlugin = {
+  requestWillFetch: async ({ request, state }: { request: Request } & GenerationState) => {
+    const marker = await caches.match("/sendo-images-generation", {
+      cacheName: "sendo-images-generation",
+    });
+    if (state !== undefined) state.generation = marker === undefined ? "" : await marker.text();
+    return request;
+  },
+  cacheWillUpdate: async ({ response, state }: { response: Response } & GenerationState) => {
+    const marker = await caches.match("/sendo-images-generation", {
+      cacheName: "sendo-images-generation",
+    });
+    const generation = marker === undefined ? "" : await marker.text();
+    return state !== undefined && generation === state.generation ? response : null;
+  },
+  cacheDidUpdate: async ({
+    cacheName,
+    request,
+    state,
+  }: { cacheName: string; request: Request } & GenerationState) => {
+    const marker = await caches.match("/sendo-images-generation", {
+      cacheName: "sendo-images-generation",
+    });
+    const generation = marker === undefined ? "" : await marker.text();
+    if (state !== undefined && generation === state.generation) return;
+    const cache = await caches.open(cacheName);
+    await cache.delete(request);
+  },
+};
 
 export default defineConfig({
   plugins: [
@@ -59,6 +107,23 @@ export default defineConfig({
         // 文字列を渡せない。Workbox の実行部分を sw.js に入れる
         inlineWorkboxRuntime: true,
         cleanupOutdatedCaches: true,
+        // sendo が中継した画像（サムネイル、フィードのアイコン）を、キャッシュを先に見て出す
+        // （docs/decisions/images.md の 3）。オフラインでも、一度出した画像を出す。入れるのは
+        // 成功（200）だけで、401 ／ 403 ／ 502 は入れない。画面のファイルとは別の名前にして、
+        // ログアウトでまとめて消せるようにする。容量の上限（100MB）は、画面の側で見る
+        runtimeCaching: [
+          {
+            urlPattern: IMAGE_CACHE_URL_PATTERN,
+            handler: "CacheFirst",
+            method: "GET",
+            options: {
+              cacheName: IMAGE_CACHE_NAME,
+              cacheableResponse: { statuses: [200] },
+              expiration: { maxAgeSeconds: IMAGE_CACHE_MAX_AGE_SECONDS, purgeOnQuotaError: true },
+              plugins: [imageCacheGenerationPlugin],
+            },
+          },
+        ],
       },
     }),
   ],
