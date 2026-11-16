@@ -15,7 +15,7 @@
   import { useReader } from "../lib/context";
   import { ArticleListState, type ListProgress } from "../lib/list.svelte";
   import { prefs } from "../lib/prefs.svelte";
-  import { handleLink, router, type View, viewHref } from "../lib/router.svelte";
+  import { handleLink, isPlainClick, router, type View, viewHref } from "../lib/router.svelte";
   import Manage from "./Manage.svelte";
   import Settings from "./Settings.svelte";
 
@@ -35,7 +35,7 @@
     menuOpen = false;
   });
 
-  type ListKind = "unread" | "all" | "starred" | "feed" | "folder" | "search";
+  type ListKind = "all" | "starred" | "feed" | "folder" | "search";
   interface Listing {
     kind: ListKind;
     query: ArticleQuery;
@@ -48,16 +48,28 @@
 
   /** 狭い画面の下のバーに並べる行き先（メニューのボタンのあとに、この順で並べる） */
   const TABS: { href: string; label: string; icon: IconName }[] = [
-    { href: "/starred", label: "スター", icon: "star" },
-    { href: "/", label: "未読", icon: "inbox" },
-    { href: "/manage", label: "追加", icon: "plus" },
-    { href: "/search", label: "検索", icon: "search" },
+    { href: "/starred", label: "Saved", icon: "star" },
+    { href: "/", label: "All", icon: "inbox" },
+    { href: "/manage", label: "Add", icon: "plus" },
+    { href: "/search", label: "Search", icon: "search" },
   ];
 
   /** 下のバーで、いまいる場所として示すもの（フィードやフォルダの一覧は、どれでもない） */
   const currentTab = $derived(TABS.find((tab) => tab.href === viewHref(router.view))?.href ?? null);
 
-  /** 開いている一覧の表示の設定（要約を出すか、並び順、未読だけ）。一覧ごとに覚える */
+  let listView = $state<ArticleList>();
+
+  /** 下のバーを押した。いまいる画面をもう一度押したら、一覧の先頭に戻る（移らない） */
+  function onTab(event: MouseEvent, href: string) {
+    if (currentTab === href && isPlainClick(event)) {
+      event.preventDefault();
+      listView?.scrollToTop();
+      return;
+    }
+    handleLink(event, href);
+  }
+
+  /** 開いている一覧の表示の設定（画像を出すか、並び順、未読だけ）。一覧ごとに覚える */
   const viewKey = $derived(viewHref(router.view));
   const options = $derived(prefs.viewOptions(viewKey));
 
@@ -70,19 +82,11 @@
       case "manage":
       case "settings":
         return null;
-      case "all":
-        return {
-          kind: "all",
-          query: { ...order },
-          title: "すべて",
-          scope: { all: true },
-          unread: reader.unread.total,
-        };
       case "search":
         return {
           kind: "search",
           query: { search: router.searchQuery, ...order },
-          title: "検索",
+          title: "Search",
           scope: null,
           unread: null,
         };
@@ -90,7 +94,7 @@
         return {
           kind: "starred",
           query: { state: "starred", ...order },
-          title: "スター",
+          title: "Saved",
           scope: null,
           unread: null,
         };
@@ -106,15 +110,16 @@
         return {
           kind: "folder",
           query: { folderId: view.id, ...state, ...order },
-          title: reader.folders.find((f) => f.id === view.id)?.name ?? "フォルダ",
+          title: reader.folders.find((f) => f.id === view.id)?.name ?? "Folder",
           scope: { folderId: view.id },
           unread: reader.unread.folders.get(view.id) ?? 0,
         };
       default:
+        // 未読は、一覧の種類ではなく、絞り込みの状態（docs/decisions/settings.md の 2）
         return {
-          kind: "unread",
-          query: { state: "unread", ...order },
-          title: "未読",
+          kind: "all",
+          query: { ...state, ...order },
+          title: "All",
           scope: { all: true },
           unread: reader.unread.total,
         };
@@ -137,7 +142,7 @@
   });
 
   const pageTitle = $derived(
-    listing?.title ?? (router.view.kind === "manage" ? "購読の管理" : "設定"),
+    listing?.title ?? (router.view.kind === "manage" ? "Manage feeds" : "Settings"),
   );
 
   // タブの名前に、未読の数を出す
@@ -302,11 +307,11 @@
     const unread = listing.unread ?? 0;
     const feed = listing.kind === "feed" ? besideFeed(1) : null;
     if (feed === null) {
-      return unread === 0 ? null : { label: "すべて既読にする", go: () => void markAll() };
+      return unread === 0 ? null : { label: "Mark all as read", go: () => void markAll() };
     }
     const title = feed.title ?? feed.url;
     return {
-      label: unread === 0 ? `次のフィード「${title}」へ` : `既読にして、次のフィード「${title}」へ`,
+      label: unread === 0 ? `Next: ${title}` : `Mark all as read, next: ${title}`,
       go: () => {
         if (unread > 0) void markAll();
         go({ kind: "feed", id: feed.id });
@@ -350,7 +355,6 @@
       chord = false;
       clearTimeout(chordTimer);
       const views: Record<string, View> = {
-        u: { kind: "unread" },
         a: { kind: "all" },
         s: { kind: "starred" },
         m: { kind: "manage" },
@@ -411,7 +415,7 @@
   <button
     type="button"
     class="scrim"
-    aria-label="メニューを閉じる"
+    aria-label="Close menu"
     tabindex="-1"
     onclick={() => (menuOpen = false)}
   ></button>
@@ -426,6 +430,7 @@
     </div>
   {:else}
     <ArticleList
+      bind:this={listView}
       {list}
       title={listing.title}
       kind={listing.kind}
@@ -447,23 +452,23 @@
     狭い画面の下のバー。一覧の画面でだけ出す（記事の画面では、同じ場所に記事の操作が入る）。
     広い画面では、左のメニューを出したままにするので出さない
   -->
-  <nav class="tabs" aria-label="主な画面">
+  <nav class="tabs" aria-label="Main">
     <button
       type="button"
       class="tab"
-      aria-label="メニュー"
+      aria-label="Menu"
       aria-expanded={menuOpen}
       onclick={() => (menuOpen = !menuOpen)}
     >
       <Icon name="menu" />
-      <span>メニュー</span>
+      <span>Menu</span>
     </button>
     {#each TABS as tab (tab.href)}
       <a
         class="tab"
         href={tab.href}
         aria-current={currentTab === tab.href ? "page" : undefined}
-        onclick={(e) => handleLink(e, tab.href)}
+        onclick={(e) => onTab(e, tab.href)}
       >
         <Icon name={tab.icon} filled={tab.icon === "star" && currentTab === tab.href} />
         <span>{tab.label}</span>
@@ -474,7 +479,7 @@
 
 <ShortcutHelp bind:open={helpOpen} />
 
-<Dialog bind:open={progressOpen} title="進み具合">
+<Dialog bind:open={progressOpen} title="Progress">
   {#if progress !== null}
     <dl class="stats">
       <div>
@@ -497,7 +502,7 @@
   {/if}
 </Dialog>
 
-<Dialog bind:open={confirmOpen} title="既読にする">
+<Dialog bind:open={confirmOpen} title="Mark as read">
   <p class="confirm">
     「{listing?.title}」の未読 {listing?.unread ?? 0} 件のうち、どれを既読にしますか。
     {#if (listing?.unread ?? 0) > UNDO_LIMIT}
@@ -509,30 +514,30 @@
     <!-- svelte-ignore a11y_autofocus -->
     <!-- biome-ignore lint/a11y/noAutofocus: 確かめの窓（dialog）の中で、Enter でそのまま進めるようにする -->
     <button type="button" class="primary" autofocus onclick={() => markAll()}>
-      すべて既読にする
+      Mark all as read
     </button>
     <button type="button" onclick={() => markAll({ publishedBefore: Date.now() - DAY })}>
-      1 日より古い記事だけ
+      Older than 1 day
     </button>
     <button type="button" onclick={() => markAll({ publishedBefore: Date.now() - 7 * DAY })}>
-      1 週間より古い記事だけ
+      Older than 1 week
     </button>
-    <button type="button" class="link" onclick={() => (confirmOpen = false)}>やめる</button>
+    <button type="button" class="link" onclick={() => (confirmOpen = false)}>Cancel</button>
   </div>
 </Dialog>
 
-<Dialog bind:open={menuOpenFor} title={menuArticle?.title ?? "（タイトルなし）"}>
+<Dialog bind:open={menuOpenFor} title={menuArticle?.title ?? "(Untitled)"}>
   {#if menuArticle !== null}
     <div class="choices">
       <button type="button" onclick={() => menuToggle("readAt")}>
-        {menuArticle.readAt === null ? "既読にする" : "未読に戻す"}
+        {menuArticle.readAt === null ? "Mark as read" : "Mark as unread"}
       </button>
       <button type="button" onclick={() => menuToggle("starredAt")}>
-        {menuArticle.starredAt === null ? "スターを付ける" : "スターを外す"}
+        {menuArticle.starredAt === null ? "Save" : "Unsave"}
       </button>
       {#if listing?.scope != null}
-        <button type="button" onclick={() => markBeside(true)}>これより上を既読にする</button>
-        <button type="button" onclick={() => markBeside(false)}>これより下を既読にする</button>
+        <button type="button" onclick={() => markBeside(true)}>Mark above as read</button>
+        <button type="button" onclick={() => markBeside(false)}>Mark below as read</button>
       {/if}
       {#if menuLink !== null}
         <a
@@ -542,7 +547,7 @@
           rel="noopener noreferrer"
           onclick={() => (menuOpenFor = false)}
         >
-          元の記事を開く
+          Open original
         </a>
       {/if}
     </div>
@@ -553,7 +558,7 @@
   <div class="toast" role="status">
     <span>{toast.message}</span>
     {#if toast.undo !== null}
-      <button type="button" onclick={undoMarkAll}>取り消す</button>
+      <button type="button" onclick={undoMarkAll}>Undo</button>
     {/if}
   </div>
 {/if}

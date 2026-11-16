@@ -19,7 +19,7 @@ test.describe("速さの予算", () => {
     await page.goto("/");
     await signIn(page);
     // すべての記事が手元に届き、Service Worker がページを受け持つまで待つ
-    await expect(page.locator("nav.sidebar a", { hasText: "未読" })).toContainText(
+    await expect(page.locator("nav.sidebar a", { hasText: "All" })).toContainText(
       String(ARTICLES),
       {
         timeout: 30_000,
@@ -56,13 +56,13 @@ test.describe("速さの予算", () => {
   test("操作への反応は 100ms 以内（スターと既読）", async ({ page, context }) => {
     await page.locator(".article-list .item").first().click();
     const view = page.locator(".article-view");
-    await expect(view.getByRole("button", { name: "スターを付ける" })).toBeVisible();
+    await expect(view.getByRole("button", { name: "Save" })).toBeVisible();
     const cdp = await context.newCDPSession(page);
     await cdp.send("Emulation.setCPUThrottlingRate", { rate: CPU_SLOWDOWN });
 
     for (const [press, expected] of [
-      ["スターを付ける", "スターを外す"],
-      ["未読に戻す", "既読にする"],
+      ["Save", "Unsave"],
+      ["Mark as unread", "Mark as read"],
     ] as const) {
       const elapsed = await page.evaluate(
         ({ press, expected }) =>

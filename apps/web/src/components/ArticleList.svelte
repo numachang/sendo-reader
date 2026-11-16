@@ -26,7 +26,7 @@
     list: ArticleListState;
     title: string;
     /** 開いている一覧の種類。空のときの文と、出す操作を決める */
-    kind: "unread" | "all" | "starred" | "feed" | "folder" | "search";
+    kind: "all" | "starred" | "feed" | "folder" | "search";
     /** 検索の画面で探している言葉（検索でなければ null） */
     search: string | null;
     onsearch: (query: string) => void;
@@ -46,6 +46,9 @@
   } = $props();
 
   const reader = useReader();
+
+  /** 未読だけに絞れる一覧（スターと検索は、絞らない） */
+  const filterable = $derived(kind === "all" || kind === "feed" || kind === "folder");
 
   /** 一覧の中で、いま開いている（開いていなければ、キーボードで選んでいる）記事 */
   const currentId = $derived(router.articleId ?? list.cursorId);
@@ -285,11 +288,11 @@
       node.dataset.swipeLabel =
         action === "read"
           ? current.readAt === null
-            ? "既読にする"
-            : "未読に戻す"
+            ? "Mark as read"
+            : "Mark as unread"
           : current.starredAt === null
-            ? "スターを付ける"
-            : "スターを外す";
+            ? "Save"
+            : "Unsave";
       node.style.setProperty("--swipe", `${dx}px`);
       if (Math.abs(dx) >= SWIPE) node.dataset.armed = "";
       else delete node.dataset.armed;
@@ -325,9 +328,117 @@
     };
   }
 
+  /**
+   * 一覧の先頭に戻る（見出しを押したとき、下のバーで今の画面をもう一度押したとき）。
+   * iPhone の「画面のいちばん上を押すと先頭に戻る」は、ページ全体を動かすときにしか効かない。
+   * ここは一覧だけを動かしているので、自分で持つ
+   */
+  export function scrollToTop() {
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    scroller?.scrollTo({ top: 0, behavior: reduce ? "auto" : "smooth" });
+  }
+
   async function reload() {
     await list.load();
     scroller?.scrollTo({ top: 0 });
+  }
+
+  /** 引いた長さ（px）が、これを超えて指を離したら、更新する */
+  const PULL_THRESHOLD = 72;
+  const PULL_MAX = 260;
+  /** 同期を待つ上限。届かなくても、手元の一覧は読み直す */
+  const PULL_SYNC_TIMEOUT_MS = 8000;
+
+  /** 一覧の先頭で、下に引いている長さ（px）。引いていなければ 0 */
+  let pull = $state(0);
+  /** 指で引いている最中（一覧を、指の動きにそのまま付いていかせる。離したら、なめらかに戻す） */
+  let dragging = $state(false);
+  let refreshing = $state(false);
+
+  /**
+   * 一覧を読み直して、同期する（先頭で下に引いたとき）。まず手元を読み直すので、ネットワークを
+   * 待たずに、既読にした記事が消えて未読の先頭に戻る。そのあと同期し、届いた記事も入れる
+   */
+  async function refresh() {
+    if (refreshing) return;
+    refreshing = true;
+    try {
+      await reload();
+      const loaded = list.generation;
+      // 届かない、時間がかかる、のどちらでも、待つのはここまで
+      await Promise.race([
+        reader.client.syncNow().catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, PULL_SYNC_TIMEOUT_MS)),
+      ]);
+      // 待っている間に、読み進めたり、別の一覧に移ったりしていたら、読み直さない（位置を先頭に
+      // 戻さない、移った先の一覧を巻き込まない）。届いた記事は「新しい記事 N 件」で知らせる
+      if (list.generation === loaded && (scroller?.scrollTop ?? 0) <= 0) await reload();
+    } catch {
+      // 読み直せなくても、一覧は前のまま使える
+    } finally {
+      refreshing = false;
+    }
+  }
+
+  /** 一覧の先頭で、指で下に引いたら更新する（マウスでは、何もしない） */
+  function pullToRefresh(node: HTMLElement) {
+    let startX = 0;
+    let startY = 0;
+    /** null はまだ向きが分からない。false は、引く動きではない（横のスワイプ、上への動き） */
+    let pulling: boolean | null = false;
+
+    function onStart(event: TouchEvent) {
+      const touch = event.touches[0];
+      pulling = false;
+      if (event.touches.length !== 1 || touch === undefined) return;
+      if (node.scrollTop > 0 || refreshing) return;
+      startX = touch.clientX;
+      startY = touch.clientY;
+      pulling = null;
+    }
+
+    function onMove(event: TouchEvent) {
+      const touch = event.touches[0];
+      if (pulling === false || touch === undefined) return;
+      const dx = touch.clientX - startX;
+      const dy = touch.clientY - startY;
+      if (pulling === null) {
+        if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+        // 横に動かした（行のスワイプ）、上に動かした、途中で一覧が動いた、なら引く動きではない
+        pulling = dy > 0 && Math.abs(dy) > Math.abs(dx) && node.scrollTop <= 0;
+        if (!pulling) return;
+      }
+      // 指より少し遅れて付いてくる（引いている手ごたえ）
+      dragging = true;
+      // 指より少し遅れて付いてくる（引いている手ごたえ）
+      pull = Math.max(0, Math.min(PULL_MAX, dy * 0.6));
+    }
+
+    function onEnd() {
+      const reached = pulling === true && pull >= PULL_THRESHOLD;
+      onCancel();
+      if (reached) void refresh();
+    }
+
+    /** ブラウザや OS がタッチを取り消した。引いた分を戻すだけで、更新はしない */
+    function onCancel() {
+      pulling = false;
+      dragging = false;
+      pull = 0;
+    }
+
+    node.addEventListener("touchstart", onStart, { passive: true });
+    node.addEventListener("touchmove", onMove, { passive: true });
+    node.addEventListener("touchend", onEnd);
+    node.addEventListener("touchcancel", onCancel);
+    return {
+      destroy() {
+        node.removeEventListener("touchstart", onStart);
+        node.removeEventListener("touchmove", onMove);
+        node.removeEventListener("touchend", onEnd);
+        node.removeEventListener("touchcancel", onCancel);
+      },
+    };
   }
 
   function toggle(article: Article, field: "readAt" | "starredAt") {
@@ -336,14 +447,14 @@
   }
 </script>
 
-<section class="article-list" aria-label={title} bind:this={scroller}>
+<section class="article-list" aria-label={title} bind:this={scroller} use:pullToRefresh>
   <header>
     {#if progress !== null}
       <button
         type="button"
         class="gauge"
-        aria-label={`この一覧の進み具合 ${progress.percent}%`}
-        title="進み具合の内訳"
+        aria-label={`Progress ${progress.percent}%`}
+        title="Progress"
         onclick={onprogress}
       >
         <svg viewBox="0 0 36 36" aria-hidden="true">
@@ -367,8 +478,8 @@
         type="search"
         enterkeyhint="search"
         autocomplete="off"
-        placeholder="記事を探す"
-        aria-label="記事を探す"
+        placeholder="Search articles"
+        aria-label="Search articles"
         value={search}
         oninput={onSearchInput}
         onkeydown={onSearchKeydown}
@@ -376,19 +487,21 @@
       >
     {:else}
       <h2>
-        <span class="name">{title}</span>
-        {#if unread !== null && unread > 0}
-          <span class="count">{unread}</span>
-        {/if}
+        <button type="button" class="to-top" title="Back to top" onclick={scrollToTop}>
+          <span class="name">{title}</span>
+          {#if unread !== null && unread > 0}
+            <span class="count">{unread}</span>
+          {/if}
+        </button>
       </h2>
     {/if}
-    {#if kind === "feed" || kind === "folder"}
+    {#if filterable}
       <button
         type="button"
         class="icon-button"
         aria-pressed={options.unreadOnly}
-        aria-label="未読だけを出す"
-        title="未読だけを出す"
+        aria-label="Unread only"
+        title="Unread only"
         onclick={() => onoption({ unreadOnly: !options.unreadOnly })}
       >
         <Icon name="filter" />
@@ -398,29 +511,18 @@
       type="button"
       class="icon-button"
       aria-pressed={options.oldestFirst}
-      aria-label="古い順に並べる"
-      title="古い順に並べる"
+      aria-label="Oldest first"
+      title="Oldest first"
       onclick={() => onoption({ oldestFirst: !options.oldestFirst })}
     >
       <Icon name="sort" />
-    </button>
-    <button
-      type="button"
-      class="icon-button"
-      aria-pressed={options.layout === "comfortable"}
-      aria-label="要約も出す"
-      title="要約も出す"
-      onclick={() =>
-        onoption({ layout: options.layout === "comfortable" ? "compact" : "comfortable" })}
-    >
-      <Icon name={options.layout === "comfortable" ? "cards" : "rows"} />
     </button>
     {#if unread !== null}
       <button
         type="button"
         class="icon-button"
-        aria-label="まとめて既読にする"
-        title="まとめて既読にする（Shift + A）"
+        aria-label="Mark all as read"
+        title="Mark all as read (Shift + A)"
         disabled={unread === 0}
         onclick={onmarkall}
       >
@@ -429,8 +531,34 @@
     {/if}
   </header>
 
+  <!--
+    先頭で下に引いたときの、すき間。引いた分だけ一覧を下に押し、まんなかに、回る印だけを出す
+    （文字は出さない）。離すと、更新している間は小さなすき間を残し、終わったら閉じる
+  -->
+  <div
+    class="pull"
+    class:dragging
+    class:pull-busy={refreshing}
+    style:height={refreshing ? undefined : `${pull}px`}
+  >
+    {#if pull > 0 || refreshing}
+      <svg
+        class="spinner"
+        class:ready={pull >= PULL_THRESHOLD}
+        viewBox="0 0 24 24"
+        aria-hidden="true"
+        style:opacity={refreshing ? undefined : String(Math.min(1, pull / PULL_THRESHOLD))}
+        style:transform={refreshing ? undefined : `rotate(${Math.round(pull * 3)}deg)`}
+      >
+        <path d="M12 3a9 9 0 1 0 9 9" />
+      </svg>
+    {/if}
+    {#if refreshing}
+      <span class="visually-hidden" role="status">Refreshing…</span>
+    {/if}
+  </div>
   {#if list.fresh > 0}
-    <button type="button" class="fresh" onclick={reload}>新しい記事 {list.fresh} 件を読む</button>
+    <button type="button" class="fresh" onclick={reload}>{list.fresh} new</button>
   {/if}
 
   {#if search !== null && search.trim() === ""}
@@ -445,14 +573,14 @@
         <div></div>
       {/each}
     </div>
-    <p class="visually-hidden" role="status">読んでいます…</p>
+    <p class="visually-hidden" role="status">Loading…</p>
   {:else if list.articles.length === 0}
     <div class="empty">
       {#if reader.feeds.length === 0}
         <Icon name="rss" />
         <p>まだフィードを購読していません。</p>
-        <a href="/manage" onclick={(e) => handleLink(e, "/manage")}>フィードを追加する</a>
-      {:else if kind === "unread" || ((kind === "feed" || kind === "folder") && options.unreadOnly)}
+        <a href="/manage" onclick={(e) => handleLink(e, "/manage")}>Add a feed</a>
+      {:else if filterable && options.unreadOnly}
         <Icon name="check" />
         <p>すべて読み終えました。</p>
       {:else if kind === "search"}
@@ -460,7 +588,7 @@
         <p>見つかりませんでした。</p>
       {:else if kind === "starred"}
         <Icon name="star" />
-        <p>スターを付けた記事が、ここに並びます。</p>
+        <p>Save した記事が、ここに並びます。</p>
       {:else}
         <p>記事はありません。</p>
       {/if}
@@ -469,7 +597,7 @@
       {/if}
     </div>
   {:else}
-    <ol class:compact={options.layout === "compact"}>
+    <ol>
       {#each rows as { article, heading } (article.id)}
         <li>
           {#if heading !== null}
@@ -489,7 +617,9 @@
               aria-current={router.articleId === article.id ? "true" : undefined}
               onclick={(e) => open(e, article.id)}
             >
+              <!-- 要約は出さない。行の高さを、どの行も同じにする（docs/decisions/images.md の 5） -->
               <span class="text">
+                <span class="title">{article.title ?? "(Untitled)"}</span>
                 <span class="meta">
                   <span class="feed-icon">
                     <RemoteImage src={reader.feedIcon(article.feedId)} />
@@ -497,12 +627,8 @@
                   <span class="feed">{reader.feedTitle(article.feedId)}</span>
                   <span class="time">{shortTime(article.publishedAt)}</span>
                 </span>
-                <span class="title">{article.title ?? "（タイトルなし）"}</span>
-                {#if options.layout === "comfortable" && article.summary}
-                  <span class="summary">{article.summary.slice(0, 240)}</span>
-                {/if}
               </span>
-              {#if options.layout === "comfortable" && article.thumbnailUrl !== null}
+              {#if article.thumbnailUrl !== null}
                 <span class="thumb"><RemoteImage src={article.thumbnailUrl} /></span>
               {/if}
             </a>
@@ -510,8 +636,8 @@
               <button
                 type="button"
                 class="icon-button"
-                aria-label={article.readAt === null ? "既読にする" : "未読に戻す"}
-                title={article.readAt === null ? "既読にする" : "未読に戻す"}
+                aria-label={article.readAt === null ? "Mark as read" : "Mark as unread"}
+                title={article.readAt === null ? "Mark as read" : "Mark as unread"}
                 onclick={() => toggle(article, "readAt")}
               >
                 <Icon name={article.readAt === null ? "check" : "circle"} />
@@ -520,8 +646,8 @@
                 type="button"
                 class="icon-button star"
                 aria-pressed={article.starredAt !== null}
-                aria-label={article.starredAt === null ? "スターを付ける" : "スターを外す"}
-                title={article.starredAt === null ? "スターを付ける" : "スターを外す"}
+                aria-label={article.starredAt === null ? "Save" : "Unsave"}
+                title={article.starredAt === null ? "Save" : "Unsave"}
                 onclick={() => toggle(article, "starredAt")}
               >
                 <Icon name="star" filled={article.starredAt !== null} />
@@ -539,11 +665,11 @@
         onclick={() => list.loadMore()}
         disabled={list.loadingMore}
       >
-        {list.loadingMore ? "読んでいます…" : "もっと読む"}
+        {list.loadingMore ? "Loading…" : "Load more"}
       </button>
     {:else}
       <div class="end">
-        <p>ここまで</p>
+        <p>End of list</p>
         {#if next !== null}
           <button type="button" class="primary" onclick={next.go}>{next.label}</button>
         {/if}
@@ -558,8 +684,69 @@
     flex-direction: column;
     min-width: 0;
     overflow-y: auto;
+    /*
+     * 端まで動かしたときに、外側（ページ）を動かさず、ブラウザ自身の引っぱり（ゴムのような戻り）も
+     * 出さない。先頭で下に引く動きは、更新に使う（すき間は、こちらで作る）
+     */
+    overscroll-behavior-y: none;
     border-right: 1px solid var(--border);
     background: var(--background);
+  }
+
+  /* 先頭で下に引いたときの、すき間。引いた分だけ、一覧を下に押す */
+  .pull {
+    display: flex;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    height: 0;
+    overflow: hidden;
+    transition: height 0.2s ease-out;
+  }
+
+  /* 引いている最中は、指の動きにそのまま付いていく */
+  .pull.dragging {
+    transition: none;
+  }
+
+  .pull-busy {
+    height: 3.25rem;
+  }
+
+  .spinner {
+    flex: none;
+    width: 1.25rem;
+    height: 1.25rem;
+    fill: none;
+    stroke: var(--faint);
+    stroke-width: 2;
+    stroke-linecap: round;
+  }
+
+  /* 離せば更新する、ところまで引いた */
+  .spinner.ready {
+    stroke: var(--accent);
+  }
+
+  .pull-busy .spinner {
+    stroke: var(--muted);
+    animation: pull-spin 0.8s linear infinite;
+  }
+
+  @keyframes pull-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pull {
+      transition: none;
+    }
+
+    .pull-busy .spinner {
+      animation: none;
+    }
   }
 
   header {
@@ -645,11 +832,28 @@
   h2 {
     display: flex;
     flex: 1;
-    align-items: baseline;
-    gap: 0.5rem;
     min-width: 0;
     margin: 0;
     font-size: 1.0625rem;
+  }
+
+  /* 見出しは、押すと一覧の先頭に戻る。見た目は見出しのまま、押せる範囲を見出しの幅いっぱいにする */
+  h2 .to-top {
+    display: flex;
+    flex: 1;
+    align-items: baseline;
+    gap: 0.5rem;
+    min-width: 0;
+    min-height: 2.25rem;
+    padding: 0;
+    border: 0;
+    background: none;
+    font-weight: inherit;
+    text-align: start;
+  }
+
+  h2 .to-top:hover {
+    background: none;
   }
 
   h2 .name {
@@ -675,7 +879,7 @@
   /* 画面の外の行は、描くのを後回しにする（長い一覧でも、動かしたときに重くしない） */
   li {
     content-visibility: auto;
-    contain-intrinsic-size: auto 5.5rem;
+    contain-intrinsic-size: auto 6.5rem;
   }
 
   h3 {
@@ -694,24 +898,32 @@
     touch-action: pan-y;
   }
 
+  /*
+   * 行に色を付けるのは、マウスで指しているとき ／ 押しているときだけ。指で触る画面では付けない
+   * （一覧を動かそうと触っただけで :active になり、触っている行が選んだように見えるため。
+   * 押して開いた行は、開いた記事の画面に替わるので、押した手ごたえの色は要らない）
+   */
   @media (hover: hover) {
-    .row:hover {
+    .row:hover,
+    .row:active {
       background: var(--hover);
     }
-  }
-
-  .row:active {
-    background: var(--hover);
   }
 
   .row.current {
     background: var(--selected);
   }
 
+  /*
+   * 行の高さは、どの行も同じにする（タイトルの長さや、画像のある・なしで変えない）。
+   * 指で動かしたときに、同じ動かし方で同じ数だけ進む
+   */
   .item {
     display: flex;
     gap: 0.75rem;
-    padding: 0.625rem 1rem 0.75rem 1.375rem;
+    align-items: center;
+    height: 6.5rem;
+    padding: 0 1rem 0 1.375rem;
     color: var(--muted);
     text-decoration: none;
   }
@@ -719,18 +931,20 @@
   .text {
     display: grid;
     flex: 1;
-    align-content: start;
-    gap: 0.125rem;
+    /* 長いフィードの名前やタイトルで、幅を押し広げない（画像の下にもぐらない） */
+    grid-template-columns: minmax(0, 1fr);
+    align-content: center;
+    gap: 0.25rem;
     min-width: 0;
   }
 
   /*
-   * サムネイル。決まった大きさの正方形で、はみ出す分は切る（縦横比の違う画像でも、行の高さは
+   * サムネイル。決まった大きさで、はみ出す分は切る（縦横比の違う画像でも、行の高さは
    * 変わらない）。場所は、画像が届く前に取っておく。読み込みに失敗したら、場所ごと出さない
    */
   .thumb {
     flex: none;
-    width: 4.5rem;
+    width: 6.75rem;
     height: 4.5rem;
     overflow: hidden;
     border-radius: var(--radius-small);
@@ -771,7 +985,7 @@
   .row.unread .item::before {
     content: "";
     position: absolute;
-    top: 1.05rem;
+    top: calc(50% - 0.21875rem);
     left: 0.5rem;
     width: 0.4375rem;
     height: 0.4375rem;
@@ -781,13 +995,15 @@
 
   .meta {
     display: flex;
-    gap: 0.5rem;
+    gap: 0.375rem;
     align-items: baseline;
+    min-width: 0;
     font-size: 0.75rem;
     color: var(--muted);
   }
 
   .feed {
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -795,53 +1011,29 @@
 
   .time {
     flex: none;
-    margin-left: auto;
     color: var(--faint);
     font-variant-numeric: tabular-nums;
+  }
+
+  /* フィードの名前と時刻の間の区切り */
+  .time::before {
+    content: "/ ";
   }
 
   .title {
     display: -webkit-box;
     overflow: hidden;
     -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
     font-size: 0.9375rem;
     line-height: 1.45;
     overflow-wrap: anywhere;
   }
 
-  .compact .title {
-    -webkit-line-clamp: 1;
-    line-clamp: 1;
-  }
-
   .row.unread .title {
     color: var(--text);
     font-weight: 600;
-  }
-
-  .summary {
-    display: -webkit-box;
-    overflow: hidden;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
-    font-size: 0.8125rem;
-    line-height: 1.5;
-    overflow-wrap: anywhere;
-  }
-
-  .compact li {
-    contain-intrinsic-size: auto 3.5rem;
-  }
-
-  .compact .item {
-    padding-block: 0.4rem 0.5rem;
-  }
-
-  .compact .row.unread .item::before {
-    top: 0.85rem;
   }
 
   /* 行の操作（既読、スター）。マウスでは、行に乗せたときと、キーボードで入ったときだけ出す */
