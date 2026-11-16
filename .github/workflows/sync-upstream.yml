@@ -1,8 +1,8 @@
 name: Sync upstream
 
 on:
-  schedule:
-    - cron: "47 * * * *"
+  # numachang/fork-sync-cron（Cloudflare の Worker）が、上流が進んだら起動する。
+  # schedule は使わない（定刻の実行が作られないことがあり、60日間活動がないと無効にもなるため）
   workflow_dispatch:
 
 permissions:

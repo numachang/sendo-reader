@@ -5,36 +5,35 @@
 
 ## 上流への自動追従
 
-[Sync upstream](https://github.com/numachang/sendo-reader/actions/workflows/sync-upstream.yml) が毎時47分に、
+上流の `main` に変更が入ると、数分のうちに
+[Sync upstream](https://github.com/numachang/sendo-reader/actions/workflows/sync-upstream.yml) が、
 上流の `main` をこの fork の `main` に取り込む。GitHub の「Sync fork」と同じ API を使い、
 独自コミットを残す。force push はせず、競合した場合は失敗して停止し、上書きしない。
-更新がなければコミットは増えない。
 取り込みで `main` が更新されると、接続済みの Cloudflare Workers Builds がビルドとデプロイを行う。
-GitHub Actions から Cloudflare を直接デプロイする設定や追加のトークンは不要。
+
+Sync upstream を起動するのは、Cloudflare の Worker
+[fork-sync-cron](https://github.com/numachang/fork-sync-cron)。毎分、上流との差分を調べ、
+遅れていれば workflow_dispatch で起動する。GitHub Actions の `schedule` は使わない
+（定刻の実行が作られないことがあったため。経緯は fork-sync-cron の README）。
+
+reader は、サーバー側の `numachang/sendo` が上流に追いつき、そのデプロイ（`Workers Builds: sendo`）が
+成功してから取り込む。API の追加など順序が必要な更新でも、手で順番を守らなくてよい。
 
 - 手動で動かすには、Actions の「Sync upstream」から「Run workflow」を選ぶ（ブランチは `main`）。
-- 認証には自動発行される `GITHUB_TOKEN`（`contents: write`）を使う。追加のシークレットは不要。
+  手動のときは、サーバー側を待たない。
+- 取り込みの認証には、自動発行される `GITHUB_TOKEN`（`contents: write`）を使う。
+  Worker が起動に使うトークンは、fork-sync-cron の README を見る。
 - このワークフローは `numachang/sendo-reader` でだけ動く。
 - 同時実行は直列にし、実行中の同期を取り消さない。
-- 停止するには、Actions の「Sync upstream」から「Disable workflow」を選ぶ。
+- 自動の同期を止めるには、Actions の「Sync upstream」から「Disable workflow」を選ぶ。
+  Worker は無効なワークフローを起動しない。
 - 失敗したら Actions のログを確認する。競合は手動で解消してから、もう一度動かす。
+  Worker は、上流に新しいコミットが来るか1時間たつまで、失敗した同期を起動し直さない。
+- 上流が進んでいるのに同期が起動されなければ、fork-sync-cron の README の「失敗したら」を見る。
+  サーバー側のデプロイが失敗している間も、reader は待つ。
 - 同期後のデプロイは、同期先コミットの「Workers Builds: sendo-reader」と Cloudflare のビルド履歴で確認する。
 
-サーバー側の `numachang/sendo` は毎時17分、reader は毎時47分に同期する。
-これはサーバーを先に更新するための時間差だが、定期実行の遅延やビルド時間によって順序は保証されない。
-API の追加など順序が必要な更新では、先に sendo のデプロイ成功を確かめてから reader を手動同期する。
-
-GitHub の定期実行には遅延があり、公開リポジトリで60日間活動がないと自動で無効になる。
-その場合は Actions から有効に戻す。
-
-定刻実行を確認するときは、Actions の実行履歴を `event:schedule` で絞る。
-`workflow_dispatch` の成功や、ワークフローの `active` 表示だけでは定刻実行の確認にはならない。
-有効なのに定刻の履歴が作られない場合は、ワークフローを一度無効化して再有効化し、
-書き込み権限のあるユーザーで `cron` を変更して登録し直す。
-その後も履歴が作られなければ、GitHub 側の調査が必要になる。
-
 参照：[fork の同期 API](https://docs.github.com/en/rest/branches/branches#sync-a-fork-branch-with-the-upstream-repository)、
-[定期実行の制約](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)、
-[トリガーのトラブルシューティング](https://docs.github.com/en/actions/how-tos/troubleshoot-workflows#troubleshooting-workflow-triggers)、
 [Workers Builds](https://developers.cloudflare.com/workers/ci-cd/builds/)、
+[起動する Worker](https://github.com/numachang/fork-sync-cron)、
 [サーバー側の運用](https://github.com/numachang/sendo/blob/main/FORK.md)。
